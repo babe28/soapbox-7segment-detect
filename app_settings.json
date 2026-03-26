@@ -1,0 +1,4 @@
+{
+  "rtsp_url": "udp://192.168.10.134:9999?fifo_size=2000000&overrun_nonfatal=1&max_delay=500000",
+  "api_url": "http://localhost:3000/api/control/external-time"
+}

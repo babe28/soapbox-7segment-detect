@@ -1,0 +1,7 @@
+app_backup.py
+.code-workspace
+__pycache__/
+env/
+venv/
+*.pyc
+*.pyo
