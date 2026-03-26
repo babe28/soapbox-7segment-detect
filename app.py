@@ -536,6 +536,16 @@ class SevenSegReaderApp:
         except (TypeError, ValueError):
             return fallback
 
+    def format_time_value(self, value):
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        if "." in raw:
+            return raw
+        if raw.isdigit() and len(raw) == 6:
+            return f"{raw[:3]}.{raw[3:]}"
+        return raw
+
     def _get_bind_host(self):
         host = self.obs_host_entry.get().strip()
         return host or "0.0.0.0"
@@ -575,7 +585,7 @@ class SevenSegReaderApp:
         if self.obs_server:
             self.obs_publish_status_var.set(f"上:{upper} / 下:{lower}")
         else:
-            self.obs_publish_status_var.set("待機中")
+            self.obs_publish_status_var.set(f"上:{upper} / 下:{lower}")
 
     def publish_obs_state(self, force=False):
         payload = {
@@ -641,6 +651,7 @@ class SevenSegReaderApp:
         if self.obs_server and self.obs_server.host == host and self.obs_server.port == port:
             self.status_var.set(f"OBS配信サーバー稼働中: {self.obs_url_var.get()}")
             self.publish_obs_state(force=True)
+            self.refresh_runtime_status()
             return
 
         self.stop_obs_server(update_status=False)
@@ -650,9 +661,11 @@ class SevenSegReaderApp:
             self.save_settings()
             self.publish_obs_state(force=True)
             self.status_var.set(f"OBS配信サーバーを開始しました: {self.obs_url_var.get()}")
+            self.refresh_runtime_status()
         except OSError as exc:
             self.obs_server = None
             self.status_var.set(f"OBS配信サーバー起動失敗: {exc}")
+            self.refresh_runtime_status()
 
     def stop_obs_server(self, update_status=True):
         if self.obs_server:
@@ -660,6 +673,7 @@ class SevenSegReaderApp:
             self.obs_server = None
         if update_status:
             self.status_var.set("OBS配信サーバーを停止しました")
+        self.refresh_runtime_status()
 
     def set_roi_target(self, target):
         self.roi_target = target
@@ -1062,29 +1076,31 @@ class SevenSegReaderApp:
 
             result_str, debug_img = self.logic_a_7seg(normalized_img)
             stable_result = self.stabilize_result(target, result_str)
-            self.raw_val[target] = result_str
-            self.current_val[target] = stable_result
+            formatted_raw = self.format_time_value(result_str)
+            formatted_stable = self.format_time_value(stable_result)
+            self.raw_val[target] = formatted_raw
+            self.current_val[target] = formatted_stable
 
             debug_img_rgb = cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB)
             display_img = cv2.resize(debug_img_rgb, (300, 50))
             photo = ImageTk.PhotoImage(image=Image.fromarray(display_img))
 
             if target == "upper":
-                self.upper_lbl.config(text=stable_result or "------")
+                self.upper_lbl.config(text=formatted_stable or "---.---")
                 self.debug_photo_upper = photo
                 self.upper_img_lbl.config(image=self.debug_photo_upper)
             else:
-                self.lower_lbl.config(text=stable_result or "------")
+                self.lower_lbl.config(text=formatted_stable or "---.---")
                 self.debug_photo_lower = photo
                 self.lower_img_lbl.config(image=self.debug_photo_lower)
 
-            if self.obs_out_var.get() and stable_result != self.last_text[target]:
+            if self.obs_out_var.get() and formatted_stable != self.last_text[target]:
                 if (current_time - self.last_save_time[target]) >= save_interval_sec:
                     filename = f"{target}_time.txt"
                     try:
                         with open(filename, "w", encoding="utf-8") as fh:
-                            fh.write(stable_result)
-                        self.last_text[target] = stable_result
+                            fh.write(formatted_stable)
+                        self.last_text[target] = formatted_stable
                         self.last_save_time[target] = current_time
                     except OSError as exc:
                         print(f"file write error: {exc}")
@@ -1134,8 +1150,8 @@ class SevenSegReaderApp:
         self._fire_api_request(self.current_val["upper"], self.current_val["lower"])
 
     def send_api_dummy(self):
-        upper_val = self.dummy_upper_entry.get()
-        lower_val = self.dummy_lower_entry.get()
+        upper_val = self.format_time_value(self.dummy_upper_entry.get())
+        lower_val = self.format_time_value(self.dummy_lower_entry.get())
         if self.obs_server:
             self.obs_server.publish(upper_val, lower_val, upper_val, lower_val)
         self._fire_api_request(upper_val, lower_val)
@@ -1147,7 +1163,10 @@ class SevenSegReaderApp:
             return
 
         self.save_settings()
-        payload = {"upper": upper_val, "lower": lower_val}
+        payload = {
+            "upper": self.format_time_value(upper_val),
+            "lower": self.format_time_value(lower_val),
+        }
         self.status_var.set(f"API送信中... ({upper_val}, {lower_val})")
         threading.Thread(target=self._post_api_thread, args=(url, payload), daemon=True).start()
 
