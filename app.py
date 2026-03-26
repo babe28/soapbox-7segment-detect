@@ -76,13 +76,14 @@ class QuietThreadingHTTPServer(ThreadingHTTPServer):
 
 
 class ObsBrowserServer:
-    def __init__(self, host, port):
+    def __init__(self, host, port, send_live_callback=None):
         self.host = host
         self.port = port
         self.hub = ObsEventHub()
         self.httpd = None
         self.thread = None
         self.template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "obs_overlay.html")
+        self.send_live_callback = send_live_callback
 
     def start(self):
         if self.httpd:
@@ -108,10 +109,15 @@ class ObsBrowserServer:
 
             def do_POST(self):
                 parsed = urlparse(self.path)
-                if parsed.path != "/api/publish":
-                    self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+                if parsed.path == "/api/publish":
+                    self._handle_publish()
                     return
+                if parsed.path == "/api/send-live":
+                    self._handle_send_live()
+                    return
+                self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
+            def _handle_publish(self):
                 content_length = int(self.headers.get("Content-Length", "0") or "0")
                 raw_body = self.rfile.read(content_length)
                 try:
@@ -129,6 +135,19 @@ class ObsBrowserServer:
                 server_ref.hub.publish(normalized)
                 self._serve_json({"ok": True, "state": server_ref.hub.snapshot()})
 
+            def _handle_send_live(self):
+                content_length = int(self.headers.get("Content-Length", "0") or "0")
+                if content_length:
+                    self.rfile.read(content_length)
+
+                if not server_ref.send_live_callback:
+                    self.send_error(HTTPStatus.NOT_IMPLEMENTED, "Send callback is not configured")
+                    return
+
+                ok, message = server_ref.send_live_callback()
+                status = HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST
+                self._serve_json({"ok": ok, "message": message}, status=status)
+
             def log_message(self, _format, *_args):
                 return
 
@@ -144,9 +163,9 @@ class ObsBrowserServer:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def _serve_json(self, payload):
+            def _serve_json(self, payload, status=HTTPStatus.OK):
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                self.send_response(HTTPStatus.OK)
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
@@ -239,12 +258,12 @@ class SevenSegReaderApp:
         self.cap = None
         self.video_loop_id = None
         self.process_loop_id = None
-        self.debug_loop_id = None
         self.live_loop_id = None
         self.image_on_canvas = None
         self.photo = None
         self.current_frame = None
         self.is_processing = False
+        self.is_paused = False
 
         self.roi_target = None
         self.rois = {"upper": None, "lower": None}
@@ -256,7 +275,6 @@ class SevenSegReaderApp:
         self.debug_photo_lower = None
 
         self.obs_out_var = tk.BooleanVar(value=False)
-        self.debug_continuous_var = tk.BooleanVar(value=False)
         self.live_continuous_var = tk.BooleanVar(value=False)
         self.fisheye_var = tk.BooleanVar(value=False)
         self.image_skew_var = tk.BooleanVar(value=False)
@@ -280,6 +298,7 @@ class SevenSegReaderApp:
         self.processing_status_var = tk.StringVar(value="停止")
         self.obs_server_status_var = tk.StringVar(value="停止")
         self.obs_publish_status_var = tk.StringVar(value="待機中")
+        self.local_post_url_var = tk.StringVar(value="")
 
         self.roi_angle_vars = {
             "upper": tk.DoubleVar(value=0.0),
@@ -466,7 +485,7 @@ class SevenSegReaderApp:
         )
         browser_frame.columnconfigure(5, weight=1)
 
-        api_frame = ttk.LabelFrame(self.right_frame, text="API連携・デバッグ")
+        api_frame = ttk.LabelFrame(self.right_frame, text="API連携")
         api_frame.pack(fill=tk.X, padx=5, pady=5)
 
         ttk.Label(api_frame, text="URL:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
@@ -482,32 +501,32 @@ class SevenSegReaderApp:
         self.live_interval_entry.insert(0, "300")
         self.live_interval_entry.pack(side=tk.LEFT)
 
-        ttk.Separator(api_frame, orient=tk.HORIZONTAL).grid(row=2, column=0, columnspan=4, sticky=tk.EW, pady=5)
-
-        ttk.Label(api_frame, text="[ダミー] 上段:").grid(row=3, column=0, sticky=tk.E, padx=5, pady=2)
-        self.dummy_upper_entry = ttk.Entry(api_frame, width=10)
-        self.dummy_upper_entry.insert(0, "123456")
-        self.dummy_upper_entry.grid(row=3, column=1, sticky=tk.W, padx=5, pady=2)
-
-        ttk.Label(api_frame, text="下段:").grid(row=3, column=2, sticky=tk.E, padx=5, pady=2)
-        self.dummy_lower_entry = ttk.Entry(api_frame, width=10)
-        self.dummy_lower_entry.insert(0, "789012")
-        self.dummy_lower_entry.grid(row=3, column=3, sticky=tk.W, padx=5, pady=2)
-
-        ctrl_api_frame = ttk.Frame(api_frame)
-        ctrl_api_frame.grid(row=4, column=0, columnspan=4, sticky=tk.W, padx=5, pady=5)
-        ttk.Button(ctrl_api_frame, text="ダミー値を1回送信", command=self.send_api_dummy).pack(side=tk.LEFT, padx=2)
-        ttk.Checkbutton(ctrl_api_frame, text="ダミー値を連続送信", variable=self.debug_continuous_var, command=self.toggle_debug_loop).pack(side=tk.LEFT, padx=(10, 2))
-        ttk.Label(ctrl_api_frame, text="間隔(ms):").pack(side=tk.LEFT)
-        self.dummy_interval_entry = ttk.Entry(ctrl_api_frame, width=6)
-        self.dummy_interval_entry.insert(0, "300")
-        self.dummy_interval_entry.pack(side=tk.LEFT)
+        ttk.Label(api_frame, text="外部POST:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=2)
+        self.local_post_url_entry = ttk.Entry(api_frame, textvariable=self.local_post_url_var)
+        self.local_post_url_entry.grid(row=2, column=1, columnspan=3, sticky=tk.EW, padx=5, pady=2)
         api_frame.columnconfigure(1, weight=1)
 
         ctrl_frame = ttk.Frame(self.right_frame)
         ctrl_frame.pack(fill=tk.X, padx=5, pady=10)
         ttk.Button(ctrl_frame, text="認識スタート", command=self.start_processing).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        ttk.Button(ctrl_frame, text="一時停止", command=self.pause_processing).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
         ttk.Button(ctrl_frame, text="ストップ", command=self.stop_processing).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+
+        big_send_frame = ttk.LabelFrame(self.right_frame, text="クイック送信")
+        big_send_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 10))
+        self.big_send_button = tk.Button(
+            big_send_frame,
+            text="本番値を送信",
+            command=self.send_api_manual,
+            font=("Yu Gothic UI", 22, "bold"),
+            bg="#d84f3d",
+            fg="white",
+            activebackground="#bf402f",
+            activeforeground="white",
+            relief=tk.FLAT,
+            height=3,
+        )
+        self.big_send_button.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         self.status_var = tk.StringVar(value="準備中...")
         self.status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
@@ -546,6 +565,41 @@ class SevenSegReaderApp:
             return f"{raw[:3]}.{raw[3:]}"
         return raw
 
+    def normalize_api_value(self, value):
+        raw = str(value or "").strip().replace(".", "")
+        return raw if raw.isdigit() else ""
+
+    def trigger_live_api_send(self):
+        if not self.api_entry.get().strip():
+            self.status_var.set("エラー: API URLを入力してください")
+            return False, "API URLが未設定です"
+
+        upper_val = self.normalize_api_value(self.stable_val["upper"])
+        lower_val = self.normalize_api_value(self.stable_val["lower"])
+        if not upper_val and not lower_val:
+            self.status_var.set("本番値がまだありません")
+            return False, "本番値がまだありません"
+
+        self.publish_obs_state(force=True)
+        self._fire_api_request(upper_val, lower_val)
+        return True, f"送信開始: {upper_val}, {lower_val}"
+
+    def trigger_live_api_send_from_http(self):
+        result = {"ok": False, "message": "送信処理を開始できませんでした"}
+        completed = threading.Event()
+
+        def run_on_ui_thread():
+            ok, message = self.trigger_live_api_send()
+            result["ok"] = ok
+            result["message"] = message
+            completed.set()
+
+        self.root.after(0, run_on_ui_thread)
+        completed.wait(timeout=3.0)
+        if not completed.is_set():
+            return False, "UIスレッドの応答待ちでタイムアウトしました"
+        return result["ok"], result["message"]
+
     def _get_bind_host(self):
         host = self.obs_host_entry.get().strip()
         return host or "0.0.0.0"
@@ -573,11 +627,40 @@ class SevenSegReaderApp:
         host = self._get_bind_host()
         port = self._get_obs_port()
         display_host = self._detect_local_ip() if host == "0.0.0.0" else host
-        self.obs_url_var.set(f"http://{display_host}:{port}/")
+        base_url = f"http://{display_host}:{port}"
+        self.obs_url_var.set(f"{base_url}/")
+        self.local_post_url_var.set(f"{base_url}/api/send-live")
+
+    def clear_output_values(self):
+        self.current_val = {"upper": "", "lower": ""}
+        self.raw_val = {"upper": "", "lower": ""}
+        self.stable_val = {"upper": "", "lower": ""}
+        self.pending_val = {"upper": "", "lower": ""}
+        self.pending_count = {"upper": 0, "lower": 0}
+        self.invalid_count = {"upper": 0, "lower": 0}
+        self.last_obs_payload = None
+        self.upper_lbl.config(text="---.---")
+        self.lower_lbl.config(text="---.---")
+
+        if self.obs_out_var.get():
+            for target in ["upper", "lower"]:
+                filename = f"{target}_time.txt"
+                try:
+                    with open(filename, "w", encoding="utf-8") as fh:
+                        fh.write("---.---")
+                    self.last_text[target] = "---.---"
+                    self.last_save_time[target] = time.time()
+                except OSError:
+                    pass
 
     def refresh_runtime_status(self):
         self.camera_status_var.set("接続中" if self.cap and self.cap.isOpened() else "未接続")
-        self.processing_status_var.set("認識中" if self.is_processing else "停止")
+        if self.is_processing:
+            self.processing_status_var.set("認識中")
+        elif self.is_paused:
+            self.processing_status_var.set("一時停止")
+        else:
+            self.processing_status_var.set("停止")
         self.obs_server_status_var.set(self.obs_url_var.get() if self.obs_server else "停止")
 
         upper = self.current_val["upper"] or "---.---"
@@ -656,7 +739,7 @@ class SevenSegReaderApp:
 
         self.stop_obs_server(update_status=False)
         try:
-            self.obs_server = ObsBrowserServer(host, port)
+            self.obs_server = ObsBrowserServer(host, port, send_live_callback=self.trigger_live_api_send_from_http)
             self.obs_server.start()
             self.save_settings()
             self.publish_obs_state(force=True)
@@ -809,6 +892,20 @@ class SevenSegReaderApp:
             self.status_var.set("カメラ接続とROI設定を確認してください")
             return
 
+        if self.is_processing:
+            self.status_var.set("認識処理はすでに動作中です")
+            self.refresh_runtime_status()
+            return
+
+        if self.is_paused:
+            self.is_paused = False
+            self.is_processing = True
+            self.status_var.set("認識処理を再開しました")
+            self.publish_obs_state(force=True)
+            self.refresh_runtime_status()
+            self.process_loop()
+            return
+
         self.last_text = {"upper": "", "lower": ""}
         self.last_save_time = {"upper": 0.0, "lower": 0.0}
         self.current_val = {"upper": "", "lower": ""}
@@ -820,16 +917,35 @@ class SevenSegReaderApp:
         self.last_obs_payload = None
 
         self.is_processing = True
+        self.is_paused = False
         self.status_var.set("認識処理を開始しました")
         self.publish_obs_state(force=True)
         self.refresh_runtime_status()
         self.process_loop()
 
-    def stop_processing(self, update_status=True):
+    def pause_processing(self):
+        if not self.is_processing:
+            self.status_var.set("認識処理は動作していません")
+            self.refresh_runtime_status()
+            return
+
         self.is_processing = False
+        self.is_paused = True
         if self.process_loop_id:
             self.root.after_cancel(self.process_loop_id)
             self.process_loop_id = None
+        self.status_var.set("認識処理を一時停止しました")
+        self.publish_obs_state(force=True)
+        self.refresh_runtime_status()
+
+    def stop_processing(self, update_status=True):
+        self.is_processing = False
+        self.is_paused = False
+        if self.process_loop_id:
+            self.root.after_cancel(self.process_loop_id)
+            self.process_loop_id = None
+        self.clear_output_values()
+        self.publish_obs_state(force=True)
         if update_status:
             self.status_var.set("認識処理を停止しました")
         self.refresh_runtime_status()
@@ -1143,18 +1259,7 @@ class SevenSegReaderApp:
         return result_str, debug_img
 
     def send_api_manual(self):
-        if not self.current_val["upper"] and not self.current_val["lower"]:
-            self.status_var.set("本番値がまだありません")
-            return
-        self.publish_obs_state(force=True)
-        self._fire_api_request(self.current_val["upper"], self.current_val["lower"])
-
-    def send_api_dummy(self):
-        upper_val = self.format_time_value(self.dummy_upper_entry.get())
-        lower_val = self.format_time_value(self.dummy_lower_entry.get())
-        if self.obs_server:
-            self.obs_server.publish(upper_val, lower_val, upper_val, lower_val)
-        self._fire_api_request(upper_val, lower_val)
+        self.trigger_live_api_send()
 
     def _fire_api_request(self, upper_val, lower_val):
         url = self.api_entry.get().strip()
@@ -1164,10 +1269,10 @@ class SevenSegReaderApp:
 
         self.save_settings()
         payload = {
-            "upper": self.format_time_value(upper_val),
-            "lower": self.format_time_value(lower_val),
+            "upper": self.normalize_api_value(upper_val),
+            "lower": self.normalize_api_value(lower_val),
         }
-        self.status_var.set(f"API送信中... ({upper_val}, {lower_val})")
+        self.status_var.set(f"API送信中... ({payload['upper']}, {payload['lower']})")
         threading.Thread(target=self._post_api_thread, args=(url, payload), daemon=True).start()
 
     def _post_api_thread(self, url, payload):
@@ -1179,24 +1284,6 @@ class SevenSegReaderApp:
                 self.root.after(0, lambda: self.status_var.set(f"APIエラー: HTTP {response.status_code}"))
         except requests.exceptions.RequestException:
             self.root.after(0, lambda: self.status_var.set("API送信失敗: 通信エラー"))
-
-    def toggle_debug_loop(self):
-        if self.debug_continuous_var.get():
-            self.status_var.set("ダミー値の連続送信を開始しました")
-            self.continuous_debug_loop()
-            return
-
-        if self.debug_loop_id:
-            self.root.after_cancel(self.debug_loop_id)
-            self.debug_loop_id = None
-        self.status_var.set("ダミー値の連続送信を停止しました")
-
-    def continuous_debug_loop(self):
-        if not self.debug_continuous_var.get():
-            return
-        self.send_api_dummy()
-        interval = self._read_interval(self.dummy_interval_entry, 300)
-        self.debug_loop_id = self.root.after(interval, self.continuous_debug_loop)
 
     def toggle_live_loop(self):
         if self.live_continuous_var.get():
@@ -1212,17 +1299,14 @@ class SevenSegReaderApp:
     def continuous_live_loop(self):
         if not self.live_continuous_var.get():
             return
-        if self.current_val["upper"] or self.current_val["lower"]:
-            self._fire_api_request(self.current_val["upper"], self.current_val["lower"])
+        if self.stable_val["upper"] or self.stable_val["lower"]:
+            self._fire_api_request(self.stable_val["upper"], self.stable_val["lower"])
         interval = self._read_interval(self.live_interval_entry, 300)
         self.live_loop_id = self.root.after(interval, self.continuous_live_loop)
 
     def on_close(self):
         self.save_settings()
-        self.debug_continuous_var.set(False)
         self.live_continuous_var.set(False)
-        if self.debug_loop_id:
-            self.root.after_cancel(self.debug_loop_id)
         if self.live_loop_id:
             self.root.after_cancel(self.live_loop_id)
         if self.process_loop_id:
